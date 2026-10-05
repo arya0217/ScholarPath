@@ -1,479 +1,254 @@
-from flask import Flask, request, jsonify, render_template, redirect, url_for, session, flash
-from flask_sqlalchemy import SQLAlchemy
+import os
+from functools import wraps
+from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, send_from_directory
+from flask_wtf import CSRFProtect
+from models import db, Student, Scholarship, SavedScholarship, Application, Admin, StudentDocument
+from matching_engine import match_scholarships
+from decision_engine import rank_matches, application_readiness, next_actions
+from werkzeug.utils import secure_filename
 from datetime import datetime
+import uuid
 
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///scholarpath.db'
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', os.urandom(32))
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///scholarpath.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.secret_key = 'scholarpath-secret-2025'
-db = SQLAlchemy(app)
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024
+app.config['UPLOAD_FOLDER'] = os.path.join(app.instance_path, 'uploads')
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(app.instance_path, exist_ok=True)
 
+db.init_app(app)
+CSRFProtect(app)
 
-# ── MODELS ──────────────────────────────────────────────────────────────────
-
-class Student(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(100), nullable=False)
-    email = db.Column(db.String(120), unique=True, nullable=False)
-    password = db.Column(db.String(100), nullable=False)
-    caste = db.Column(db.String(20))
-    income = db.Column(db.Integer)
-    marks = db.Column(db.Float)
-    state = db.Column(db.String(50))
-    gender = db.Column(db.String(10))
-    stream = db.Column(db.String(50))
-    disability = db.Column(db.Boolean, default=False)
-    area = db.Column(db.String(10))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-    def profile_complete(self):
-        return all([self.caste, self.income, self.marks, self.state, self.gender, self.stream])
-
-    def profile_percent(self):
-        fields = [self.caste, self.income, self.marks, self.state, self.gender, self.stream, self.area, self.disability is not None]
-        filled = sum(1 for f in fields if f)
-        return int((filled / len(fields)) * 100)
-
-
-class Scholarship(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(200), nullable=False)
-    provider = db.Column(db.String(200))
-    amount = db.Column(db.Integer)
-    deadline = db.Column(db.String(20))
-    apply_url = db.Column(db.String(300))
-    description = db.Column(db.Text)
-    is_verified = db.Column(db.Boolean, default=False)
-    allowed_caste = db.Column(db.String(200))
-    max_income = db.Column(db.Integer)
-    min_marks = db.Column(db.Float)
-    allowed_states = db.Column(db.String(500))
-    allowed_gender = db.Column(db.String(10))
-    allowed_stream = db.Column(db.String(200))
-    disability_required = db.Column(db.Boolean)
-    allowed_area = db.Column(db.String(10))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-
-class SavedScholarship(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    student_id = db.Column(db.Integer, db.ForeignKey('student.id'))
-    scholarship_id = db.Column(db.Integer, db.ForeignKey('scholarship.id'))
-    saved_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-
-class Application(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    student_id = db.Column(db.Integer, db.ForeignKey('student.id'))
-    scholarship_id = db.Column(db.Integer, db.ForeignKey('scholarship.id'))
-    status = db.Column(db.String(20), default='Applied')
-    applied_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-
-class Admin(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(50), unique=True, nullable=False)
-    password = db.Column(db.String(100), nullable=False)
-
-
-# ── MATCHING ENGINE ──────────────────────────────────────────────────────────
-
-def build_inverted_index(student):
-    candidates = Scholarship.query.all()
-    shortlist = []
-    for s in candidates:
-        if s.allowed_caste and student.caste:
-            allowed = [c.strip() for c in s.allowed_caste.split(',')]
-            if student.caste not in allowed and 'Any' not in allowed:
-                continue
-        if s.max_income and student.income:
-            if student.income > s.max_income:
-                continue
-        shortlist.append(s)
-    return shortlist
-
-def evaluate_ast(scholarship, student):
-    results = {}
-    if scholarship.allowed_caste:
-        allowed = [c.strip() for c in scholarship.allowed_caste.split(',')]
-        results['caste'] = (student.caste in allowed) if 'Any' not in allowed else True
-    else:
-        results['caste'] = True
-    if scholarship.max_income:
-        results['income'] = (student.income <= scholarship.max_income) if student.income else False
-    else:
-        results['income'] = True
-    if scholarship.min_marks:
-        results['marks'] = (student.marks >= scholarship.min_marks) if student.marks else False
-    else:
-        results['marks'] = True
-    if scholarship.allowed_states:
-        allowed = [s.strip() for s in scholarship.allowed_states.split(',')]
-        results['state'] = (student.state in allowed) if 'Any' not in allowed else True
-    else:
-        results['state'] = True
-    if scholarship.allowed_gender and scholarship.allowed_gender != 'Any':
-        results['gender'] = (student.gender == scholarship.allowed_gender)
-    else:
-        results['gender'] = True
-    if scholarship.allowed_stream:
-        allowed = [s.strip() for s in scholarship.allowed_stream.split(',')]
-        results['stream'] = (student.stream in allowed) if 'Any' not in allowed else True
-    else:
-        results['stream'] = True
-    if scholarship.disability_required is not None:
-        results['disability'] = (student.disability == scholarship.disability_required)
-    else:
-        results['disability'] = True
-    if scholarship.allowed_area and scholarship.allowed_area != 'Any':
-        results['area'] = (student.area == scholarship.allowed_area)
-    else:
-        results['area'] = True
-    return all(results.values())
-
-def match_scholarships(student):
-    shortlist = build_inverted_index(student)
-    matches = []
-    for s in shortlist:
-        if evaluate_ast(s, student):
-            matches.append(s)
-    return matches
-
-
-# ── SEED DATA ────────────────────────────────────────────────────────────────
-
-def seed_data():
-    if Scholarship.query.count() > 0:
-        return
-    scholarships = [
-        Scholarship(name="Post Matric Scholarship for SC Students", provider="Ministry of Social Justice, Govt. of India", amount=12000, deadline="31-Oct-2025", apply_url="https://scholarships.gov.in", description="Financial assistance for SC students pursuing post-matric education.", is_verified=True, allowed_caste="SC", max_income=250000, allowed_states="Any", allowed_gender="Any", allowed_stream="Any", allowed_area="Any"),
-        Scholarship(name="Post Matric Scholarship for ST Students", provider="Ministry of Tribal Affairs, Govt. of India", amount=12000, deadline="31-Oct-2025", apply_url="https://scholarships.gov.in", description="Financial assistance for ST students pursuing post-matric education.", is_verified=True, allowed_caste="ST", max_income=250000, allowed_states="Any", allowed_gender="Any", allowed_stream="Any", allowed_area="Any"),
-        Scholarship(name="Central Sector Scheme for College Students", provider="Ministry of Education, Govt. of India", amount=10000, deadline="31-Dec-2025", apply_url="https://scholarships.gov.in", description="Merit based scholarship for top students in class 12.", is_verified=True, allowed_caste="Any", max_income=800000, min_marks=80.0, allowed_states="Any", allowed_gender="Any", allowed_stream="Any", allowed_area="Any"),
-        Scholarship(name="Pragati Scholarship for Girl Students (Technical)", provider="AICTE", amount=50000, deadline="30-Nov-2025", apply_url="https://www.aicte-india.org", description="Scholarship for girl students pursuing technical education.", is_verified=True, allowed_caste="Any", max_income=800000, allowed_states="Any", allowed_gender="Female", allowed_stream="Engineering", allowed_area="Any"),
-        Scholarship(name="Saksham Scholarship for Differently Abled", provider="AICTE", amount=50000, deadline="30-Nov-2025", apply_url="https://www.aicte-india.org", description="For differently abled students in technical programs.", is_verified=True, allowed_caste="Any", max_income=800000, allowed_states="Any", allowed_gender="Any", allowed_stream="Engineering", disability_required=True, allowed_area="Any"),
-        Scholarship(name="Begum Hazrat Mahal National Scholarship", provider="Maulana Azad Education Foundation", amount=12000, deadline="30-Sep-2025", apply_url="https://maef.net.in", description="For meritorious girl students from minority communities.", is_verified=True, allowed_caste="Any", max_income=200000, min_marks=50.0, allowed_states="Any", allowed_gender="Female", allowed_stream="Any", allowed_area="Any"),
-        Scholarship(name="Maharashtra Post Matric Scholarship (OBC)", provider="Social Welfare Dept, Maharashtra", amount=15000, deadline="31-Dec-2025", apply_url="https://mahadbt.maharashtra.gov.in", description="For OBC students from Maharashtra.", is_verified=True, allowed_caste="OBC", max_income=300000, allowed_states="Maharashtra", allowed_gender="Any", allowed_stream="Any", allowed_area="Any"),
-        Scholarship(name="Ishan Uday Scholarship for NE Students", provider="UGC", amount=54000, deadline="31-Dec-2025", apply_url="https://scholarships.gov.in", description="For students from North Eastern states pursuing higher education.", is_verified=True, allowed_caste="Any", max_income=450000, allowed_states="Assam,Meghalaya,Manipur,Mizoram,Nagaland,Tripura,Arunachal Pradesh,Sikkim", allowed_gender="Any", allowed_stream="Any", allowed_area="Any"),
-        Scholarship(name="Inspire Scholarship for Higher Education", provider="DST, Govt. of India", amount=80000, deadline="30-Nov-2025", apply_url="https://online-inspire.gov.in", description="For top science students to pursue natural and basic sciences.", is_verified=True, allowed_caste="Any", min_marks=75.0, allowed_states="Any", allowed_gender="Any", allowed_stream="Science", allowed_area="Any"),
-        Scholarship(name="Vidyasaarathi Scholarship", provider="NSDL e-Governance", amount=40000, deadline="28-Feb-2026", apply_url="https://www.vidyasaarathi.co.in", description="For SC/ST/OBC students with good academic record.", is_verified=True, allowed_caste="SC,ST,OBC", max_income=250000, min_marks=60.0, allowed_states="Any", allowed_gender="Any", allowed_stream="Any", allowed_area="Any"),
-        Scholarship(name="NSP Pre-Matric Scholarship for Minorities", provider="Ministry of Minority Affairs", amount=10000, deadline="31-Oct-2025", apply_url="https://scholarships.gov.in", description="For minority students in rural areas.", is_verified=True, allowed_caste="Any", max_income=100000, min_marks=50.0, allowed_states="Any", allowed_gender="Any", allowed_stream="Any", allowed_area="Rural"),
-        Scholarship(name="Tata Capital Pankh Scholarship", provider="Tata Capital", amount=12000, deadline="31-Aug-2025", apply_url="https://www.tatacapital.com", description="For underprivileged students with academic excellence.", is_verified=True, allowed_caste="Any", max_income=250000, min_marks=60.0, allowed_states="Any", allowed_gender="Any", allowed_stream="Any", allowed_area="Any"),
-        Scholarship(name="Sitaram Jindal Foundation Scholarship", provider="Sitaram Jindal Foundation", amount=24000, deadline="30-Jun-2025", apply_url="https://sitaramjindalfoundation.org", description="Merit cum means scholarship for deserving students.", is_verified=False, allowed_caste="Any", max_income=150000, min_marks=60.0, allowed_states="Any", allowed_gender="Any", allowed_stream="Any", allowed_area="Any"),
-        Scholarship(name="L'Oreal India For Young Women in Science", provider="L'Oreal India", amount=250000, deadline="31-Mar-2026", apply_url="https://www.loreal.com/en/india", description="For outstanding female science students.", is_verified=True, allowed_caste="Any", min_marks=85.0, allowed_states="Any", allowed_gender="Female", allowed_stream="Science", allowed_area="Any"),
-        Scholarship(name="Reliance Foundation Undergraduate Scholarship", provider="Reliance Foundation", amount=200000, deadline="28-Feb-2026", apply_url="https://reliancefoundation.org", description="For meritorious students from low income families.", is_verified=True, allowed_caste="Any", max_income=250000, min_marks=60.0, allowed_states="Any", allowed_gender="Any", allowed_stream="Any", allowed_area="Any"),
-        Scholarship(name="Dr. Ambedkar Post Matric Scholarship (SC/ST)", provider="Govt. of Karnataka", amount=18000, deadline="31-Dec-2025", apply_url="https://sw.kar.nic.in", description="For SC/ST students from Karnataka.", is_verified=True, allowed_caste="SC,ST", max_income=250000, allowed_states="Karnataka", allowed_gender="Any", allowed_stream="Any", allowed_area="Any"),
-        Scholarship(name="Swami Vivekananda Merit-cum-Means Scholarship", provider="Govt. of West Bengal", amount=60000, deadline="31-Oct-2025", apply_url="https://svmcm.wbhed.gov.in", description="For meritorious students from West Bengal.", is_verified=True, allowed_caste="Any", max_income=250000, min_marks=75.0, allowed_states="West Bengal", allowed_gender="Any", allowed_stream="Any", allowed_area="Any"),
-        Scholarship(name="Bihar Post Matric Scholarship (BC/EBC)", provider="BC/EBC Welfare Dept, Bihar", amount=15000, deadline="31-Jan-2026", apply_url="https://pmsonline.bih.nic.in", description="For BC/EBC students from Bihar.", is_verified=True, allowed_caste="OBC", max_income=150000, allowed_states="Bihar", allowed_gender="Any", allowed_stream="Any", allowed_area="Any"),
-        Scholarship(name="Uttarakhand Post Matric Scholarship (SC)", provider="Social Welfare Dept, Uttarakhand", amount=10000, deadline="30-Nov-2025", apply_url="https://scholarship.uk.gov.in", description="For SC students from Uttarakhand.", is_verified=True, allowed_caste="SC", max_income=200000, allowed_states="Uttarakhand", allowed_gender="Any", allowed_stream="Any", allowed_area="Any"),
-        Scholarship(name="HDFC Badhte Kadam Scholarship", provider="HDFC Bank Parivartan", amount=18000, deadline="31-Aug-2025", apply_url="https://hdfcbank.com", description="For students from rural areas with financial need.", is_verified=True, allowed_caste="Any", max_income=250000, min_marks=55.0, allowed_states="Any", allowed_gender="Any", allowed_stream="Any", allowed_area="Rural"),
-    ]
-    for s in scholarships:
-        db.session.add(s)
-
-    if Admin.query.count() == 0:
-        db.session.add(Admin(username="admin", password="admin123"))
-
+with app.app_context():
+    db.create_all()
+    # Lightweight migration for existing SQLite MVP databases.
+    from sqlalchemy import inspect, text
+    inspector = inspect(db.engine)
+    scholarship_columns = {c['name'] for c in inspector.get_columns('scholarship')}
+    if 'required_documents' not in scholarship_columns:
+        with db.engine.begin() as conn:
+            conn.execute(text("ALTER TABLE scholarship ADD COLUMN required_documents TEXT DEFAULT ''"))
+    # Give legacy seeded scholarships meaningful document requirements after migration.
+    legacy_docs = {
+        'National Merit Scholarship': 'Marksheet,Income Certificate,Bank Passbook',
+        'SC Higher Education Grant': 'Caste Certificate,Income Certificate,Marksheet',
+        'Women in STEM Scholarship': 'Marksheet,Bonafide Certificate,Bank Passbook',
+        'Rural Student Opportunity Grant': 'Income Certificate,Residence Certificate,Marksheet',
+    }
+    for scholarship_name, docs in legacy_docs.items():
+        legacy = Scholarship.query.filter_by(name=scholarship_name).first()
+        if legacy and not legacy.required_documents:
+            legacy.required_documents = docs
     db.session.commit()
-    print(f"Seeded {len(scholarships)} scholarships and 1 admin.")
+    if not Admin.query.filter_by(username='admin').first():
+        a = Admin(username='admin'); a.set_password(os.environ.get('ADMIN_PASSWORD', 'admin123')); db.session.add(a); db.session.commit()
+    if Scholarship.query.count() == 0:
+        seed = [
+            Scholarship(name='National Merit Scholarship', provider='Government of India', amount=50000, deadline='2026-12-31', verified=True, allowed_caste='Any', max_income=800000, min_marks=75, allowed_states='Any', allowed_gender='Any', allowed_stream='Any', disability_required=None, allowed_area='Any', required_documents='Marksheet,Income Certificate,Bank Passbook', description='Merit support for eligible Indian students.', url='https://scholarships.gov.in/'),
+            Scholarship(name='SC Higher Education Grant', provider='Education Department', amount=60000, deadline='2026-11-30', verified=True, allowed_caste='SC', max_income=500000, min_marks=60, allowed_states='Any', allowed_gender='Any', allowed_stream='Any', disability_required=None, allowed_area='Any', required_documents='Caste Certificate,Income Certificate,Marksheet', description='Higher education support for SC students.', url='https://scholarships.gov.in/'),
+            Scholarship(name='Women in STEM Scholarship', provider='Future Skills Foundation', amount=75000, deadline='2026-10-31', verified=True, allowed_caste='Any', max_income=700000, min_marks=70, allowed_states='Any', allowed_gender='Female', allowed_stream='Science,Engineering', disability_required=None, allowed_area='Any', required_documents='Marksheet,Bonafide Certificate,Bank Passbook', description='Scholarship for women pursuing STEM degrees.', url='https://scholarships.gov.in/'),
+            Scholarship(name='Rural Student Opportunity Grant', provider='Rural Education Trust', amount=40000, deadline='2026-09-30', verified=False, allowed_caste='Any', max_income=400000, min_marks=55, allowed_states='Gujarat,Rajasthan,Madhya Pradesh', allowed_gender='Any', allowed_stream='Any', disability_required=None, allowed_area='Rural', required_documents='Income Certificate,Residence Certificate,Marksheet', description='Support for students from rural communities.', url='https://scholarships.gov.in/'),
+        ]
+        db.session.add_all(seed); db.session.commit()
 
+def current_student(): return Student.query.get(session.get('student_id')) if session.get('student_id') else None
 
-# ── HELPERS ──────────────────────────────────────────────────────────────────
+def student_required(f):
+    @wraps(f)
+    def w(*a, **kw):
+        if not current_student(): return redirect(url_for('home'))
+        return f(*a, **kw)
+    return w
 
-def current_student():
-    sid = session.get('student_id')
-    return Student.query.get(sid) if sid else None
+def admin_required(f):
+    @wraps(f)
+    def w(*a, **kw):
+        if not session.get('admin_id'): return redirect(url_for('home'))
+        return f(*a, **kw)
+    return w
 
-def current_admin():
-    aid = session.get('admin_id')
-    return Admin.query.get(aid) if aid else None
+def explanation_rows(node):
+    rows=[]
+    def walk(n, group=None):
+        t=n.get('type')
+        if t=='leaf': rows.append({'label': n['label'], 'passed': n['passed'], 'wildcard': ': Any' in n['label']})
+        elif t=='or':
+            children=n.get('children',[])
+            passed_any=any(c.get('passed') for c in children)
+            label=' or '.join(c.get('label','') for c in children)
+            rows.append({'label': label, 'passed': passed_any, 'wildcard': False})
+        elif t=='and':
+            for c in n.get('children',[]): walk(c, group)
+        elif t=='not': walk(n.get('child',{}), group)
+    walk(node); return rows
 
+@app.context_processor
+def inject(): return {'student': current_student()}
 
-# ── STUDENT ROUTES ────────────────────────────────────────────────────────────
-
-@app.route('/')
-def index():
-    if current_student():
-        return redirect(url_for('dashboard'))
+@app.route('/', methods=['GET','POST'])
+def home():
+    if request.method=='POST':
+        action=request.form.get('action')
+        if action=='register':
+            name=request.form.get('name','').strip(); email=request.form.get('email','').strip().lower(); password=request.form.get('password','')
+            if not name or '@' not in email or len(password)<8: flash('Please enter a valid name, email, and password of at least 8 characters.','error')
+            elif Student.query.filter_by(email=email).first(): flash('An account with that email already exists.','error')
+            else:
+                s=Student(name=name,email=email,password=''); s.set_password(password); db.session.add(s); db.session.commit(); session['student_id']=s.id; return redirect(url_for('profile'))
+        elif action=='login':
+            email=request.form.get('email','').strip().lower(); password=request.form.get('password',''); s=Student.query.filter_by(email=email).first()
+            if s and s.check_password(password): session.clear(); session['student_id']=s.id; return redirect(url_for('dashboard'))
+            a=Admin.query.filter_by(username=email).first()
+            if a and a.check_password(password): session.clear(); session['admin_id']=a.id; return redirect(url_for('admin_dashboard'))
+            flash('Invalid email or password','error')
     return render_template('login.html')
 
-@app.route('/login', methods=['POST'])
-def login():
-    email = request.form.get('email')
-    password = request.form.get('password')
-    student = Student.query.filter_by(email=email, password=password).first()
-    if not student:
-        return render_template('login.html', error="Invalid email or password.")
-    session['student_id'] = student.id
-    return redirect(url_for('dashboard'))
+@app.get('/logout')
+def logout(): session.clear(); return redirect(url_for('home'))
 
-@app.route('/register', methods=['POST'])
-def register():
-    name = request.form.get('name')
-    email = request.form.get('email')
-    password = request.form.get('password')
-    if Student.query.filter_by(email=email).first():
-        return render_template('login.html', error="Email already registered.", tab='register')
-    student = Student(name=name, email=email, password=password)
-    db.session.add(student)
-    db.session.commit()
-    session['student_id'] = student.id
-    return redirect(url_for('profile'))
-
-@app.route('/logout')
-def logout():
-    session.clear()
-    return redirect(url_for('index'))
-
-@app.route('/profile', methods=['GET', 'POST'])
+@app.route('/profile', methods=['GET','POST'])
+@student_required
 def profile():
-    student = current_student()
-    if not student:
-        return redirect(url_for('index'))
-    if request.method == 'POST':
-        student.marks = float(request.form.get('marks') or 0) or None
-        student.stream = request.form.get('stream') or None
-        student.caste = request.form.get('caste') or None
-        student.gender = request.form.get('gender') or None
-        student.income = int(request.form.get('income') or 0) or None
-        student.area = request.form.get('area') or None
-        student.state = request.form.get('state') or None
-        student.disability = bool(int(request.form.get('disability', 0)))
-        db.session.commit()
-        flash('Profile saved successfully.', 'success')
-        return redirect(url_for('dashboard'))
-    return render_template('profile.html', student=student)
+    s=current_student()
+    if request.method=='POST':
+        s.caste=request.form.get('caste') or None; s.state=request.form.get('state') or None; s.gender=request.form.get('gender') or None; s.stream=request.form.get('stream') or None; s.area=request.form.get('area') or None
+        try: s.income=float(request.form.get('income')) if request.form.get('income') else None
+        except ValueError: s.income=None
+        try: s.marks=float(request.form.get('marks')) if request.form.get('marks') else None
+        except ValueError: s.marks=None
+        s.disability = request.form.get('disability') == 'yes' if request.form.get('disability') else None
+        db.session.commit(); flash('Profile saved.','success'); return redirect(url_for('dashboard'))
+    return render_template('profile.html', s=s)
 
-@app.route('/dashboard')
+@app.get('/dashboard')
+@student_required
 def dashboard():
-    student = current_student()
-    if not student:
-        return redirect(url_for('index'))
+    s=current_student(); scholarships=Scholarship.query.all(); matches=match_scholarships(s,scholarships)
+    verified=request.args.get('verified')=='1'; order=request.args.get('order','')
+    if verified: matches=[m for m in matches if m[0].verified]
+    q=request.args.get('q','').strip().lower()
+    if q: matches=[m for m in matches if q in m[0].name.lower() or q in m[0].provider.lower()]
+    ranked=rank_matches(matches, s.documents)
+    if order=='asc': ranked=sorted(ranked,key=lambda x:x['scholarship'].amount or 0)
+    elif order=='desc': ranked=sorted(ranked,key=lambda x:x['scholarship'].amount or 0, reverse=True)
+    saved_ids={x.scholarship_id for x in SavedScholarship.query.filter_by(student_id=s.id)}
+    apps={x.scholarship_id:x for x in Application.query.filter_by(student_id=s.id)}
+    total=sum(x['scholarship'].amount or 0 for x in ranked)
+    top=ranked[:3]
+    for item in top:
+        item['actions']=next_actions(item, apps.get(item['scholarship'].id))
+    return render_template('dashboard.html', ranked=ranked, top=top, saved_ids=saved_ids, apps=apps, total=total, verified=verified, order=order, q=q, explanation_rows=explanation_rows)
 
-    search = request.args.get('search', '').lower()
-    filter_verified = request.args.get('verified', '')
-    filter_amount = request.args.get('amount', '')
-    tab = request.args.get('tab', 'matches')
+@app.route('/documents', methods=['GET','POST'])
+@student_required
+def documents():
+    student=current_student()
+    if request.method=='POST':
+        document_type=request.form.get('document_type','').strip()
+        uploaded=request.files.get('file')
+        allowed={'pdf','png','jpg','jpeg'}
+        ext=uploaded.filename.rsplit('.',1)[-1].lower() if uploaded and '.' in uploaded.filename else ''
+        if not document_type or not uploaded or ext not in allowed:
+            flash('Choose a document type and upload a PDF, JPG, or PNG file.','error')
+        else:
+            filename=f"{student.id}_{uuid.uuid4().hex}_{secure_filename(uploaded.filename)}"
+            uploaded.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+            db.session.add(StudentDocument(student_id=student.id, document_type=document_type, file_path=filename))
+            db.session.commit(); flash('Document added to your vault.','success')
+        return redirect(url_for('documents'))
+    docs=StudentDocument.query.filter_by(student_id=student.id).order_by(StudentDocument.uploaded_at.desc()).all()
+    return render_template('documents.html', documents=docs)
 
-    matches = match_scholarships(student) if student.profile_complete() else []
+@app.post('/documents/<int:doc_id>/delete')
+@student_required
+def delete_document(doc_id):
+    doc=StudentDocument.query.filter_by(id=doc_id, student_id=current_student().id).first_or_404()
+    path=os.path.join(app.config['UPLOAD_FOLDER'], doc.file_path)
+    if os.path.exists(path): os.remove(path)
+    db.session.delete(doc); db.session.commit(); return redirect(url_for('documents'))
 
-    # Apply search and filters
-    if search:
-        matches = [m for m in matches if search in m.name.lower() or search in (m.provider or '').lower()]
-    if filter_verified == '1':
-        matches = [m for m in matches if m.is_verified]
-    if filter_amount == 'asc':
-        matches = sorted(matches, key=lambda x: x.amount or 0)
-    elif filter_amount == 'desc':
-        matches = sorted(matches, key=lambda x: x.amount or 0, reverse=True)
+@app.get('/documents/file/<int:doc_id>')
+@student_required
+def document_file(doc_id):
+    doc=StudentDocument.query.filter_by(id=doc_id, student_id=current_student().id).first_or_404()
+    return send_from_directory(app.config['UPLOAD_FOLDER'], doc.file_path, as_attachment=False)
 
-    saved_ids = {s.scholarship_id for s in SavedScholarship.query.filter_by(student_id=student.id).all()}
-    saved_scholarships = [Scholarship.query.get(sid) for sid in saved_ids]
-    applications = Application.query.filter_by(student_id=student.id).all()
-    app_map = {a.scholarship_id: a for a in applications}
+@app.get('/scholarship/<int:sid>')
+@student_required
+def detail(sid):
+    scholarship=Scholarship.query.get_or_404(sid); student=current_student(); passed, explanation=__import__('matching_engine').evaluate_ast(scholarship,student)
+    rows=explanation_rows(explanation); saved=SavedScholarship.query.filter_by(student_id=student.id,scholarship_id=scholarship.id).first(); appn=Application.query.filter_by(student_id=student.id,scholarship_id=scholarship.id).first()
+    ranked=rank_matches([(scholarship, explanation)], student.documents)[0]
+    ranked['actions']=next_actions(ranked, appn)
+    return render_template('detail.html', scholarship=scholarship, rows=rows, passed=passed, saved=bool(saved), application=appn, decision=ranked)
 
-    total_amount = sum(m.amount for m in matches if m.amount)
-    verified_count = sum(1 for m in matches if m.is_verified)
+@app.post('/save/<int:sid>')
+@student_required
+def save(sid):
+    s=current_student(); obj=SavedScholarship.query.filter_by(student_id=s.id,scholarship_id=sid).first()
+    if obj: db.session.delete(obj)
+    else: db.session.add(SavedScholarship(student_id=s.id,scholarship_id=sid))
+    db.session.commit(); return redirect(request.referrer or url_for('dashboard'))
 
-    return render_template('dashboard.html',
-        student=student,
-        matches=matches,
-        saved_ids=saved_ids,
-        saved_scholarships=saved_scholarships,
-        app_map=app_map,
-        total_amount=total_amount,
-        verified_count=verified_count,
-        tab=tab,
-        search=search,
-        filter_verified=filter_verified,
-        filter_amount=filter_amount,
-    )
+@app.post('/apply/<int:sid>')
+@student_required
+def apply(sid):
+    s=current_student(); obj=Application.query.filter_by(student_id=s.id,scholarship_id=sid).first()
+    if not obj: db.session.add(Application(student_id=s.id,scholarship_id=sid,status='Applied')); db.session.commit()
+    return redirect(url_for('detail',sid=sid))
 
-@app.route('/scholarship/<int:sid>')
-def scholarship_detail(sid):
-    student = current_student()
-    if not student:
-        return redirect(url_for('index'))
-    s = Scholarship.query.get_or_404(sid)
-    is_saved = SavedScholarship.query.filter_by(student_id=student.id, scholarship_id=sid).first() is not None
-    application = Application.query.filter_by(student_id=student.id, scholarship_id=sid).first()
-    return render_template('detail.html', student=student, scholarship=s, is_saved=is_saved, application=application)
+@app.post('/application/<int:aid>/status')
+@student_required
+def application_status(aid):
+    obj=Application.query.get_or_404(aid); obj.status=request.form.get('status','Applied'); db.session.commit(); return redirect(url_for('detail',sid=obj.scholarship_id))
 
-@app.route('/save/<int:sid>', methods=['POST'])
-def save_scholarship(sid):
-    student = current_student()
-    if not student:
-        return redirect(url_for('index'))
-    existing = SavedScholarship.query.filter_by(student_id=student.id, scholarship_id=sid).first()
-    if existing:
-        db.session.delete(existing)
-    else:
-        db.session.add(SavedScholarship(student_id=student.id, scholarship_id=sid))
-    db.session.commit()
-    return redirect(request.referrer or url_for('dashboard'))
+@app.get('/api/decision/<int:student_id>')
+def api_decision(student_id):
+    s=Student.query.get_or_404(student_id)
+    ranked=rank_matches(match_scholarships(s, Scholarship.query.all()), s.documents)
+    return jsonify([{
+        'id': x['scholarship'].id, 'name': x['scholarship'].name, 'priority_score': x['score'],
+        'readiness_percent': x['readiness']['percent'], 'missing_documents': x['readiness']['missing'],
+        'deadline_days': x['deadline_days'], 'criteria_score': x['criteria_score']
+    } for x in ranked])
 
-@app.route('/apply/<int:sid>', methods=['POST'])
-def apply_scholarship(sid):
-    student = current_student()
-    if not student:
-        return redirect(url_for('index'))
-    existing = Application.query.filter_by(student_id=student.id, scholarship_id=sid).first()
-    if not existing:
-        db.session.add(Application(student_id=student.id, scholarship_id=sid, status='Applied'))
-        db.session.commit()
-    return redirect(url_for('scholarship_detail', sid=sid))
+@app.get('/api/scholarships')
+def api_scholarships(): return jsonify([{'id':s.id,'name':s.name,'provider':s.provider,'amount':s.amount,'verified':s.verified} for s in Scholarship.query.all()])
 
-@app.route('/update-status/<int:aid>', methods=['POST'])
-def update_status(aid):
-    student = current_student()
-    if not student:
-        return redirect(url_for('index'))
-    application = Application.query.get_or_404(aid)
-    if application.student_id != student.id:
-        return redirect(url_for('dashboard'))
-    application.status = request.form.get('status', 'Applied')
-    application.updated_at = datetime.utcnow()
-    db.session.commit()
-    return redirect(url_for('scholarship_detail', sid=application.scholarship_id))
-
-
-# ── ADMIN ROUTES ──────────────────────────────────────────────────────────────
-
-@app.route('/admin/login', methods=['GET', 'POST'])
-def admin_login():
-    if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
-        admin = Admin.query.filter_by(username=username, password=password).first()
-        if not admin:
-            return render_template('admin_login.html', error="Invalid credentials.")
-        session['admin_id'] = admin.id
-        return redirect(url_for('admin_dashboard'))
-    return render_template('admin_login.html')
-
-@app.route('/admin/logout')
-def admin_logout():
-    session.pop('admin_id', None)
-    return redirect(url_for('admin_login'))
+@app.get('/api/matches/<int:student_id>')
+def api_matches(student_id):
+    s=Student.query.get_or_404(student_id); return jsonify([{'id':x.id,'name':x.name,'amount':x.amount,'explanation':e} for x,e in match_scholarships(s,Scholarship.query.all())])
 
 @app.route('/admin')
-def admin_dashboard():
-    if not current_admin():
-        return redirect(url_for('admin_login'))
-    total_scholarships = Scholarship.query.count()
-    total_students = Student.query.count()
-    total_applications = Application.query.count()
-    total_verified = Scholarship.query.filter_by(is_verified=True).count()
-    scholarships = Scholarship.query.order_by(Scholarship.created_at.desc()).all()
-    recent_students = Student.query.order_by(Student.created_at.desc()).limit(5).all()
-    return render_template('admin_dashboard.html',
-        total_scholarships=total_scholarships,
-        total_students=total_students,
-        total_applications=total_applications,
-        total_verified=total_verified,
-        scholarships=scholarships,
-        recent_students=recent_students,
-    )
+@admin_required
+def admin_dashboard(): return render_template('admin_dashboard.html', scholarships=Scholarship.query.order_by(Scholarship.id.desc()).all(), students=Student.query.order_by(Student.id.desc()).limit(5).all(), application_count=Application.query.count())
 
-@app.route('/admin/scholarship/add', methods=['GET', 'POST'])
-def admin_add_scholarship():
-    if not current_admin():
-        return redirect(url_for('admin_login'))
-    if request.method == 'POST':
-        s = Scholarship(
-            name=request.form.get('name'),
-            provider=request.form.get('provider'),
-            amount=int(request.form.get('amount') or 0) or None,
-            deadline=request.form.get('deadline'),
-            apply_url=request.form.get('apply_url'),
-            description=request.form.get('description'),
-            is_verified=bool(request.form.get('is_verified')),
-            allowed_caste=request.form.get('allowed_caste') or None,
-            max_income=int(request.form.get('max_income') or 0) or None,
-            min_marks=float(request.form.get('min_marks') or 0) or None,
-            allowed_states=request.form.get('allowed_states') or None,
-            allowed_gender=request.form.get('allowed_gender') or None,
-            allowed_stream=request.form.get('allowed_stream') or None,
-            allowed_area=request.form.get('allowed_area') or None,
-        )
-        db.session.add(s)
-        db.session.commit()
-        flash('Scholarship added successfully.', 'success')
-        return redirect(url_for('admin_dashboard'))
-    return render_template('admin_scholarship_form.html', scholarship=None)
+@app.route('/admin/scholarship/add', methods=['GET','POST'])
+@app.route('/admin/scholarship/edit/<int:sid>', methods=['GET','POST'])
+@admin_required
+def admin_scholarship(sid=None):
+    s=Scholarship.query.get_or_404(sid) if sid else Scholarship()
+    if request.method=='POST':
+        for f in ['name','provider','deadline','url','description','allowed_caste','allowed_states','allowed_gender','allowed_stream','allowed_area','required_documents']:
+            setattr(s,f,request.form.get(f,'').strip())
+        for f in ['amount','max_income','min_marks']:
+            try: setattr(s,f,float(request.form.get(f))) if request.form.get(f) else setattr(s,f,None)
+            except ValueError: setattr(s,f,None)
+        s.verified=request.form.get('verified')=='on'
+        s.disability_required=None if request.form.get('disability_required') in ('','any') else request.form.get('disability_required')=='yes'
+        db.session.add(s); db.session.commit(); return redirect(url_for('admin_dashboard'))
+    return render_template('admin_scholarship_form.html', s=s)
 
-@app.route('/admin/scholarship/edit/<int:sid>', methods=['GET', 'POST'])
-def admin_edit_scholarship(sid):
-    if not current_admin():
-        return redirect(url_for('admin_login'))
-    s = Scholarship.query.get_or_404(sid)
-    if request.method == 'POST':
-        s.name = request.form.get('name')
-        s.provider = request.form.get('provider')
-        s.amount = int(request.form.get('amount') or 0) or None
-        s.deadline = request.form.get('deadline')
-        s.apply_url = request.form.get('apply_url')
-        s.description = request.form.get('description')
-        s.is_verified = bool(request.form.get('is_verified'))
-        s.allowed_caste = request.form.get('allowed_caste') or None
-        s.max_income = int(request.form.get('max_income') or 0) or None
-        s.min_marks = float(request.form.get('min_marks') or 0) or None
-        s.allowed_states = request.form.get('allowed_states') or None
-        s.allowed_gender = request.form.get('allowed_gender') or None
-        s.allowed_stream = request.form.get('allowed_stream') or None
-        s.allowed_area = request.form.get('allowed_area') or None
-        db.session.commit()
-        flash('Scholarship updated successfully.', 'success')
-        return redirect(url_for('admin_dashboard'))
-    return render_template('admin_scholarship_form.html', scholarship=s)
+@app.post('/admin/scholarship/<int:sid>/delete')
+@admin_required
+def admin_delete(sid):
+    s=Scholarship.query.get_or_404(sid); db.session.delete(s); db.session.commit(); return redirect(url_for('admin_dashboard'))
 
-@app.route('/admin/scholarship/delete/<int:sid>', methods=['POST'])
-def admin_delete_scholarship(sid):
-    if not current_admin():
-        return redirect(url_for('admin_login'))
-    s = Scholarship.query.get_or_404(sid)
-    SavedScholarship.query.filter_by(scholarship_id=sid).delete()
-    Application.query.filter_by(scholarship_id=sid).delete()
-    db.session.delete(s)
-    db.session.commit()
-    flash('Scholarship deleted.', 'success')
-    return redirect(url_for('admin_dashboard'))
+@app.post('/admin/scholarship/<int:sid>/verify')
+@admin_required
+def admin_verify(sid):
+    s=Scholarship.query.get_or_404(sid); s.verified=not s.verified; db.session.commit(); return redirect(url_for('admin_dashboard'))
 
-@app.route('/admin/scholarship/toggle-verify/<int:sid>', methods=['POST'])
-def admin_toggle_verify(sid):
-    if not current_admin():
-        return redirect(url_for('admin_login'))
-    s = Scholarship.query.get_or_404(sid)
-    s.is_verified = not s.is_verified
-    db.session.commit()
-    return redirect(url_for('admin_dashboard'))
-
-
-# ── API ───────────────────────────────────────────────────────────────────────
-
-@app.route('/api/matches/<int:student_id>')
-def api_matches(student_id):
-    student = Student.query.get(student_id)
-    if not student:
-        return jsonify({'error': 'Student not found'}), 404
-    matches = match_scholarships(student)
-    return jsonify({'student_id': student_id, 'count': len(matches),
-                    'matches': [{'id': m.id, 'name': m.name, 'amount': m.amount} for m in matches]})
-
-@app.route('/api/scholarships')
-def api_scholarships():
-    scholarships = Scholarship.query.all()
-    return jsonify([{'id': s.id, 'name': s.name, 'provider': s.provider, 'amount': s.amount} for s in scholarships])
-
-
-# ── INIT ──────────────────────────────────────────────────────────────────────
-
-if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
-        seed_data()
-    print("\n ScholarPath is running!")
-    print(" Student: http://127.0.0.1:5000")
-    print(" Admin:   http://127.0.0.1:5000/admin/login")
-    print(" Admin credentials: admin / admin123\n")
-    app.run(debug=True)
+if __name__=='__main__': app.run(debug=True)
